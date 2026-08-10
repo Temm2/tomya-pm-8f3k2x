@@ -405,12 +405,17 @@ def fetch_hn_whoishiring():
     return jobs
 
 
-# ---- Web3 VC portfolio job boards (Getro-powered) -----------------------
-# Crypto VCs run "portfolio jobs" boards via Getro, aggregating postings
-# from ALL their portfolio companies in one place -- and portfolio
-# companies skew heavily early-stage (seed to Series B), which is exactly
-# the gap the ~1,000-company defi-jobs-list sweep doesn't fill (that list
-# is dominated by more established protocols with their own direct ATS).
+# ---- Web3 VC/ecosystem job boards (Getro-powered) -----------------------
+# Two flavors of Getro network, both worth having:
+#  - VC portfolio boards (Dragonfly, Multicoin, Coinbase Ventures): all
+#    postings from that fund's portfolio companies, which skew early-stage.
+#  - Ecosystem boards (Solana, BNB Chain): run by the chain foundation,
+#    aggregating postings from every project building on that chain --
+#    Solana's alone spans 170+ companies (Phantom, Orca, Wormhole, etc.).
+# Both types are dominated by smaller/earlier-stage teams that don't have
+# their own polished direct ATS, which is exactly the gap the ~1,000-
+# company defi-jobs-list sweep (dominated by larger, established protocols
+# with their own Greenhouse/Lever/Ashby boards) doesn't fill.
 #
 # Getro doesn't expose a documented public JSON API, but job URLs follow a
 # stable, predictable pattern: /companies/{company-slug}/jobs/{id}-{title-slug}
@@ -428,6 +433,12 @@ GETRO_NETWORKS = [
     {"name": "Dragonfly Portfolio", "base": "https://jobs.dragonfly.xyz"},
     {"name": "Multicoin Capital Portfolio", "base": "https://jobs.multicoin.capital"},
     {"name": "Coinbase Ventures Portfolio", "base": "https://coinbase.getro.com"},
+    {"name": "Electric Capital Portfolio", "base": "https://jobs.electriccapital.com"},
+    {"name": "Blockchain Capital Portfolio", "base": "https://jobs.blockchaincapital.com"},
+    {"name": "CoinFund Portfolio", "base": "https://jobs.coinfund.io"},
+    {"name": "Framework Ventures Portfolio", "base": "https://jobs.framework.ventures"},
+    {"name": "Solana Ecosystem", "base": "https://jobs.solana.com"},
+    {"name": "BNB Chain Ecosystem", "base": "https://jobs.bnbchain.org"},
 ]
 
 GETRO_JOB_URL_RE = re.compile(r"/companies/([a-z0-9\-]+)/jobs/(\d+)-([a-z0-9\-]+)")
@@ -473,7 +484,7 @@ def fetch_getro_network(network):
     return jobs
 
 
-def fetch_all_getro_networks(max_workers=6):
+def fetch_all_getro_networks(max_workers=10):
     jobs = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(fetch_getro_network, n): n for n in GETRO_NETWORKS}
