@@ -75,6 +75,9 @@ TITLE_KEYWORDS = [
     "product manager", "product lead", "head of product", "product owner",
     "founding product manager", "founding pm", "first product manager",
     "first pm", "1st product hire", "founding product hire",
+    "director of product", "vp of product", "vice president of product",
+    "svp of product", "senior vice president of product",
+    "chief product officer",
 ]
 
 # Bonus keywords -- if these appear in title OR description, we tag the
@@ -107,6 +110,8 @@ REMOTE_INCLUDE_PATTERNS = [
 REMOTE_EXCLUDE_PATTERNS = [
     "us only", "u.s. only", "usa only", "united states only",
     "us-based only", "us based only", "us citizens only",
+    "us applicants only", "us candidates only", "us residents only",
+    "must be a us resident", "must be a us citizen",
     "uk only", "united kingdom only", "eu only", "european union only",
     "emea only", "apac only", "latam only", "canada only",
     "canada-based", "canada based",
@@ -174,6 +179,7 @@ def fetch_remoteok():
             "url": item.get("url", ""),
             "salary": item.get("salary_min") and f"${item['salary_min']}-${item.get('salary_max','?')}" or "",
             "text": (item.get("description") or "")[:2000],
+            "remote_native": True,  # RemoteOK only lists remote roles
         })
     return jobs
 
@@ -198,6 +204,7 @@ def fetch_remotive():
             "url": item.get("url", ""),
             "salary": item.get("salary", "") or "",
             "text": (item.get("description") or "")[:2000],
+            "remote_native": True,  # Remotive only lists remote roles
         })
     return jobs
 
@@ -227,6 +234,7 @@ def fetch_wwr():
             "url": link,
             "salary": "",
             "text": desc,
+            "remote_native": True,  # WWR only lists remote roles
         })
     return jobs
 
@@ -265,7 +273,7 @@ def fetch_cryptojobslist():
 
 def fetch_himalayas():
     """Himalayas public JSON search API."""
-    url = "https://himalayas.app/jobs/api/search?keywords=product%20manager&limit=20"
+    url = "https://himalayas.app/jobs/api/search?keywords=product%20manager&limit=50"
     req = urllib.request.Request(url, headers={"User-Agent": "job-alert-bot"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         data = json.loads(resp.read().decode("utf-8"))
@@ -285,6 +293,7 @@ def fetch_himalayas():
             "url": item.get("applicationLink", ""),
             "salary": item.get("minSalary") and f"${item['minSalary']}-${item.get('maxSalary','?')}" or "",
             "text": (item.get("excerpt") or "")[:2000],
+            "remote_native": True,  # Himalayas only lists remote roles
         })
     return jobs
 
@@ -339,6 +348,7 @@ def fetch_jobicy():
             "url": item.get("url", ""),
             "salary": salary,
             "text": (item.get("jobExcerpt") or "")[:2000],
+            "remote_native": True,  # Jobicy only lists remote roles
         })
     return jobs
 
@@ -405,6 +415,74 @@ def fetch_hn_whoishiring():
     return jobs
 
 
+# ---- Telegram web3 job channels -----------------------------------------
+# Public Telegram channels expose a lightweight, unauthenticated preview
+# page at t.me/s/{channel} -- real, well-established technique (Telegram's
+# "widget" HTML, class names like tgme_widget_message have been stable for
+# years), no login or API key needed. This is different from the Telegram
+# Bot API, which can't passively read a channel's message history.
+#
+# Twitter/X has no equivalent free option -- its free API tier doesn't
+# support search at all (only reading/posting your own bot's tweets), so
+# there's no legitimate free way to monitor it and it's not included here.
+#
+# Caveat: unlike the other sources, these are unstructured chat messages,
+# not structured job postings -- title/company are best-effort text
+# extraction, and some messages render as "open in Telegram to view" in
+# the static preview (can't be read without the app). This is honestly the
+# least reliable source in the bot, included because it's the only way to
+# reach this channel of postings at all, wrapped in error handling so a
+# parsing miss just yields fewer results rather than breaking the run.
+
+TELEGRAM_CHANNELS = ["remoteweb3jobs", "web3hiring", "laborx"]
+
+TELEGRAM_MESSAGE_RE = re.compile(
+    r'data-post="[^/"]+/(\d+)".*?class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
+    re.DOTALL,
+)
+
+
+def fetch_telegram_channel(channel):
+    url = f"https://t.me/s/{channel}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (job-alert-bot)"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw_html = resp.read().decode("utf-8", errors="ignore")
+
+    jobs = []
+    for msg_id, block in TELEGRAM_MESSAGE_RE.findall(raw_html):
+        text = strip_html(block)
+        if not text or not any(k in text.lower() for k in TITLE_KEYWORDS):
+            continue
+        # Best-effort company guess from "at CompanyName" phrasing, common
+        # in these channels' posting format (e.g. "Product Manager at Acme").
+        company = ""
+        cm = re.search(r"\bat\s+([A-Z][\w&.\-\s]{1,40})", text)
+        if cm:
+            company = cm.group(1).strip()
+        jobs.append({
+            "source": f"Telegram @{channel}",
+            "id": f"tg-{channel}-{msg_id}",
+            "title": f"Product Manager role mentioned — {company or 'see posting'}",
+            "company": company,
+            "location": "",
+            "url": f"https://t.me/{channel}/{msg_id}",
+            "salary": "",
+            "text": text[:3000],
+        })
+    return jobs
+
+
+def fetch_all_telegram_channels():
+    jobs = []
+    for ch in TELEGRAM_CHANNELS:
+        try:
+            ch_jobs = fetch_telegram_channel(ch)
+            jobs.extend(ch_jobs)
+        except Exception as e:
+            print(f"  (skipped Telegram channel @{ch}: {e})", file=sys.stderr)
+    return jobs
+
+
 # ---- Web3 VC/ecosystem job boards (Getro-powered) -----------------------
 # Two flavors of Getro network, both worth having:
 #  - VC portfolio boards (Dragonfly, Multicoin, Coinbase Ventures): all
@@ -413,6 +491,9 @@ def fetch_hn_whoishiring():
 #    aggregating postings from every project building on that chain --
 #    Solana's alone spans 170+ companies (Phantom, Orca, Wormhole, etc.).
 # Both types are dominated by smaller/earlier-stage teams that don't have
+# their own polished direct ATS, which is exactly the gap the ~1,000-
+# company defi-jobs-list sweep (dominated by larger, established protocols
+# with their own Greenhouse/Lever/Ashby boards) doesn't fill.
 # their own polished direct ATS, which is exactly the gap the ~1,000-
 # company defi-jobs-list sweep (dominated by larger, established protocols
 # with their own Greenhouse/Lever/Ashby boards) doesn't fill.
@@ -437,8 +518,13 @@ GETRO_NETWORKS = [
     {"name": "Blockchain Capital Portfolio", "base": "https://jobs.blockchaincapital.com"},
     {"name": "CoinFund Portfolio", "base": "https://jobs.coinfund.io"},
     {"name": "Framework Ventures Portfolio", "base": "https://jobs.framework.ventures"},
+    {"name": "a16z Portfolio", "base": "https://portfoliojobs.a16z.com"},
     {"name": "Solana Ecosystem", "base": "https://jobs.solana.com"},
     {"name": "BNB Chain Ecosystem", "base": "https://jobs.bnbchain.org"},
+    {"name": "Arbitrum Ecosystem", "base": "https://jobs.arbitrum.io"},
+    {"name": "Avalanche Ecosystem", "base": "https://jobs.avax.network"},
+    {"name": "Optimism Ecosystem", "base": "https://jobs.optimism.io"},
+    {"name": "Blockchain Association", "base": "https://jobs.theblockchainassociation.org"},
 ]
 
 GETRO_JOB_URL_RE = re.compile(r"/companies/([a-z0-9\-]+)/jobs/(\d+)-([a-z0-9\-]+)")
@@ -484,7 +570,7 @@ def fetch_getro_network(network):
     return jobs
 
 
-def fetch_all_getro_networks(max_workers=10):
+def fetch_all_getro_networks(max_workers=14):
     jobs = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(fetch_getro_network, n): n for n in GETRO_NETWORKS}
@@ -507,6 +593,21 @@ DEFI_LIST_URL = "https://raw.githubusercontent.com/tonisives/defi-jobs-list/main
 # undocumented internal widget endpoint that changes without notice, so it
 # doesn't meet the "stable free API" bar the others do.)
 SUPPORTED_ATS = {"greenhouse", "lever", "ashby", "recruitee", "workable"}
+
+# Manually verified companies, added directly rather than relying on the
+# auto-pulled defi-jobs-list -- guaranteed accurate since each slug was
+# confirmed against the company's real, current careers page. Useful both
+# as a safety net (covered even if the daily list ever drops or renames
+# one of these) and for explicitly prioritizing ecosystems you work in
+# directly. Add more here any time by giving the company name, its ATS
+# (greenhouse/lever/ashby/recruitee/workable), and the slug from its
+# careers URL.
+EXTRA_COMPANIES = [
+    {"name": "Zora", "ats": "greenhouse", "slug": "zora"},                 # Base
+    {"name": "Phantom", "ats": "ashby", "slug": "phantom"},                # Solana
+    {"name": "Magic Eden", "ats": "ashby", "slug": "magiceden"},           # Solana
+    {"name": "Jito Labs", "ats": "lever", "slug": "jito.wtf"},             # Solana
+]
 
 TABLE_ROW_RE = re.compile(r"^\|(.+)\|$")
 
@@ -726,7 +827,16 @@ def fetch_all_web3_companies(max_workers=25):
         companies = load_web3_company_boards()
     except Exception as e:
         print(f"Failed to load web3 company list: {e}", file=sys.stderr)
-        return []
+        companies = []
+
+    # Merge in the manually verified list, deduping by (ats, slug) so a
+    # company already present in the auto-pulled list isn't fetched twice.
+    seen_keys = {(c["ats"], c["slug"]) for c in companies}
+    for extra in EXTRA_COMPANIES:
+        key = (extra["ats"], extra["slug"])
+        if key not in seen_keys:
+            companies.append(extra)
+            seen_keys.add(key)
 
     fetch_fn = {
         "greenhouse": fetch_greenhouse_company,
@@ -755,15 +865,21 @@ def fetch_all_web3_companies(max_workers=25):
 def is_globally_remote(job):
     """True if the role reads as open to anyone, anywhere.
 
-    Checked in three tiers, in order:
+    Checked in four tiers, in order:
       1. Explicit global-acceptance language (GLOBAL_OVERRIDE_PATTERNS)
          wins outright -- this rescues US-anchored postings that
          explicitly say they accept applicants from anywhere.
       2. Region-lock / hybrid / onsite language (REMOTE_EXCLUDE_PATTERNS)
          disqualifies -- e.g. "Remote (US only)" contains "remote" but
-         isn't globally remote.
+         isn't globally remote. Applies regardless of source.
       3. Generic remote language (REMOTE_INCLUDE_PATTERNS) passes.
-      4. No signal at all -> dropped, since it can't be confirmed.
+      4. No signal at all: for sources that are remote-only job boards by
+         definition (job["remote_native"] is True -- RemoteOK, Remotive,
+         WeWorkRemotely, Jobicy, Himalayas), trust that and pass, since
+         every listing there is already remote by the board's own nature.
+         For everything else (company career pages, HN, Telegram, Getro
+         boards -- all of which mix remote and onsite postings), no
+         signal means it's dropped, since it genuinely can't be confirmed.
     """
     blob = f"{job.get('location','')} {job.get('title','')} {job.get('text','')}".lower()
     for pat in GLOBAL_OVERRIDE_PATTERNS:
@@ -775,6 +891,8 @@ def is_globally_remote(job):
     for pat in REMOTE_INCLUDE_PATTERNS:
         if pat in blob:
             return True
+    if job.get("remote_native"):
+        return True
     return False  # no remote signal at all -> can't confirm, so skip it
 
 
@@ -900,6 +1018,14 @@ def main():
         all_jobs.extend(getro_jobs)
     except Exception as e:
         print(f"Getro network sweep failed: {e}", file=sys.stderr)
+
+    # Telegram web3 job channels
+    try:
+        telegram_jobs = fetch_all_telegram_channels()
+        print(f"Telegram channels: {len(telegram_jobs)} title matches")
+        all_jobs.extend(telegram_jobs)
+    except Exception as e:
+        print(f"Telegram sweep failed: {e}", file=sys.stderr)
 
     print(f"Total title matches before remote/salary filters: {len(all_jobs)}")
 
