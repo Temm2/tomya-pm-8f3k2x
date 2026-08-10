@@ -1,0 +1,34 @@
+name: Job Alert Check
+
+on:
+  schedule:
+    # Runs every 4 hours. GitHub Actions cron is UTC. (Slightly wider spacing
+    # than before since each run now also sweeps ~1,000 company career pages.)
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit seen_jobs.json back
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run job check
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python check_jobs.py
+
+      - name: Commit updated seen_jobs.json
+        run: |
+          git config user.name "job-alert-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add seen_jobs.json
+          git diff --staged --quiet || git commit -m "Update seen jobs [skip ci]"
+          git push
