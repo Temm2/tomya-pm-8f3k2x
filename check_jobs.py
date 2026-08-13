@@ -173,7 +173,9 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")  # set via repo secret
 # passes_ai_remote_check below). If unset, this layer is simply skipped
 # and the keyword/regex filters alone decide -- nothing breaks either way.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.0-flash"  # check ai.google.dev/gemini-api/docs/models if this is ever renamed
+GEMINI_MODEL = "gemini-flash-latest"  # alias that follows Google's current stable Flash model, so this
+# doesn't need manual updates every time they deprecate a specific dated model (which happens every
+# few months) -- if it ever needs to change, check ai.google.dev/gemini-api/docs/models
 AI_CHECK_MAX_PER_RUN = 50  # keeps well within the free tier's rate/quota limits
 
 
@@ -1465,10 +1467,16 @@ def main():
     # isn't re-checked (and re-billed against quota) on every future run.
     to_notify = []
     ai_checks_used = 0
+    ai_calls_succeeded = 0
+    ai_calls_failed = 0
     for job in new_jobs:
         if GEMINI_API_KEY and ai_checks_used < AI_CHECK_MAX_PER_RUN:
             ai_checks_used += 1
             ai_result = passes_ai_remote_check(job)
+            if ai_result is None:
+                ai_calls_failed += 1
+            else:
+                ai_calls_succeeded += 1
             time.sleep(2)  # stay comfortably under free-tier rate limits
             if ai_result is False:
                 seen.add(job["id"])  # don't re-check this one again next run
@@ -1477,8 +1485,15 @@ def main():
         to_notify.append(job)
 
     if GEMINI_API_KEY:
-        print(f"AI-checked {ai_checks_used} new postings; "
+        print(f"AI-checked {ai_checks_used} new postings "
+              f"({ai_calls_succeeded} succeeded, {ai_calls_failed} failed/unavailable); "
               f"{len(new_jobs) - len(to_notify)} dropped by AI, {len(to_notify)} remain")
+        if ai_checks_used > 0 and ai_calls_succeeded == 0:
+            print("WARNING: every AI check call failed this run (0 succeeded). "
+                  "The AI layer is silently doing nothing -- check the "
+                  "'AI check unavailable' error lines above for the cause "
+                  "(e.g. a deprecated model name, invalid key, or quota exceeded).",
+                  file=sys.stderr)
 
     send_digest(to_notify)
     for job in to_notify:
