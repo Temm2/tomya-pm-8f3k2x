@@ -1158,75 +1158,117 @@ REMOTE_EXCLUDE_PROXIMITY_REGEXES = [
 ]
 
 
-# Country/region names that, when they appear ALONE in the location field,
-# mean "remote, but locked to this place" -- extremely common phrasing on
-# remote job boards (e.g. RemoteOK/Remotive frequently just put "United
-# States" as the location for a US-only remote role, with no "only"/"must
-# be" wording anywhere for the phrase-based excludes to catch). Scoped to
-# the location field specifically (not the whole blob) to avoid false
-# positives like "join us" in body text.
-#
-# Deliberately no local "safe word" override here (an earlier version had
-# one) -- even words like "worldwide" or "global" show up constantly as
-# marketing copy about the COMPANY/PRODUCT ("millions of users worldwide")
-# with no bearing on whether the ROLE itself is open worldwide, and no
-# fixed word list can reliably tell the difference. The only legitimate
-# rescue for a bare-locked location is GLOBAL_OVERRIDE_PATTERNS above
-# (checked first, tier 1) -- those are specific hiring-context phrases
-# ("open to global applicants," "hiring globally") that don't show up as
-# generic company-description filler the way single words do.
-BARE_LOCKED_LOCATION_RE = re.compile(
-    r"\b(united states|usa|u\.s\.a?\.?|uk|united kingdom|canada|australia|"
-    r"germany|france|spain|italy|netherlands|ireland|singapore|japan)\b"
+# Rather than trying to enumerate every restrictive country (impossible --
+# an earlier version hardcoded only 13, silently missing India, Brazil,
+# Mexico, Berlin, Dubai, and literally every other place on Earth), this
+# takes the opposite approach: strip every known generic/worldwide word
+# and common connector word out of the location field, then check if
+# anything is left over. If there's meaningful text remaining, that's a
+# specific named place (whatever country or city it is) and the role is
+# locked to it -- this generalizes to ANY country/city automatically,
+# not just ones anticipated in advance. Scoped to the location field
+# specifically (not the whole blob) since that's short, structured
+# metadata -- unlike free-text descriptions, it's not at risk of
+# marketing-copy contamination the way "global"/"worldwide" are
+# elsewhere in this file.
+LOCATION_GENERIC_WORDS_RE = re.compile(
+    r"\b(remote|anywhere|worldwide|world\s*wide|world|global|globally|latam|"
+    r"latin\s*america|americas|caribbean|international|any\s*location|"
+    r"any\s*country|location\s*independent|distributed|multiple\s*countries|"
+    r"multiple\s*locations|flexible|and|or|the|only|based|in|of|from|for|at|to)\b"
 )
 
 
-def is_globally_remote(job):
-    """True if the role reads as open to anyone, anywhere.
+def location_names_specific_place(location):
+    """True if, after stripping generic/worldwide words, the location
+    field still has meaningful text left over -- meaning it's naming an
+    actual place (any country, any city, anywhere), not describing
+    worldwide/flexible eligibility."""
+    if not location:
+        return False
+    residual = LOCATION_GENERIC_WORDS_RE.sub(" ", location.lower())
+    residual = re.sub(r"[^a-zA-Z]", "", residual)
+    return len(residual) >= 2
 
-    Checked in five tiers, in order:
+
+
+def classify_remote_status(job):
+    """Classifies a job as 'pass', 'fail', or 'borderline' for remote-
+    worldwide eligibility.
+
+    Checked in six tiers, in order:
+      0. The Dominican Republic is explicitly named anywhere in the
+         posting (e.g. part of a multi-country eligible list) -- the
+         strongest possible signal, 'pass' outright before anything else.
       1. Explicit global-acceptance language (GLOBAL_OVERRIDE_PATTERNS)
-         wins outright -- this rescues US-anchored postings that
+         wins outright ('pass') -- this rescues US-anchored postings that
          explicitly say they accept applicants from anywhere.
       2. Region-lock / hybrid / onsite language -- both the fixed-phrase
          REMOTE_EXCLUDE_PATTERNS and the proximity-based
          REMOTE_EXCLUDE_PROXIMITY_REGEXES (which catch wording variations
          the fixed list can't anticipate, e.g. "US based applicants
-         only") -- disqualifies. Applies regardless of source.
-      3. A bare country/region name in the LOCATION FIELD specifically
-         (e.g. location is just "United States") with no worldwide
-         language anywhere else in the posting -- disqualifies. This is
-         the common case that doesn't say "only" or "must be" anywhere,
-         it just lists the required country as the location.
-      4. Generic remote language (REMOTE_INCLUDE_PATTERNS) passes.
+         only") -- 'fail' outright. These are strong enough explicit
+         signals that they're not worth spending an AI call to double-
+         check; they hold regardless of source.
+      3. Any specific place named in the LOCATION FIELD (any country, any
+         city -- not a fixed list) with no worldwide/flexible wording
+         anywhere in that field -- 'borderline', NOT an automatic fail.
+         This is deliberately not a hard rejection: a company's location
+         field commonly just shows its HQ city even for a role the
+         description explains is genuinely remote-first and open
+         worldwide (or "in your timezone") without needing to say
+         "LATAM" or name any specific country -- keyword matching alone
+         can't reliably tell that apart from an actually-restricted role,
+         so it's handed to the AI layer (if configured) to actually read
+         and reason about, rather than guessed at with more keywords.
+      4. Generic remote language (REMOTE_INCLUDE_PATTERNS) -- 'pass'.
       5. No signal at all: for sources that are remote-only job boards by
          definition (job["remote_native"] is True -- RemoteOK, Remotive,
-         WeWorkRemotely, Jobicy, Himalayas), trust that and pass, since
+         WeWorkRemotely, Jobicy, Himalayas), trust that ('pass'), since
          every listing there is already remote by the board's own nature.
-         For everything else (company career pages, HN, Telegram, Getro
-         boards -- all of which mix remote and onsite postings), no
-         signal means it's dropped, since it genuinely can't be confirmed.
+         For everything else, no signal means 'fail', since it genuinely
+         can't be confirmed and there's no location-field ambiguity to
+         hand to the AI layer either (nothing there to reason about).
     """
     location = (job.get("location", "") or "").lower()
     blob = f"{location} {job.get('title','')} {job.get('text','')}".lower()
+
+    # Strongest possible signal: the posting explicitly names the
+    # Dominican Republic as an eligible location (e.g. "Remote - US,
+    # Mexico, Colombia, Dominican Republic, Brazil"). Checked before
+    # everything else, since otherwise location_names_specific_place
+    # below would see the surrounding country list as "a specific place"
+    # and incorrectly flag a role that has literally already confirmed
+    # you're eligible by name.
+    if re.search(r"\b(dominican republic|dominicana|santo domingo)\b", blob):
+        return "pass"
+
     for pat in GLOBAL_OVERRIDE_PATTERNS:
         if pat in blob:
-            return True
+            return "pass"
     for pat in REMOTE_EXCLUDE_PATTERNS:
         if pat in blob:
-            return False
+            return "fail"
     for rx in REMOTE_EXCLUDE_PROXIMITY_REGEXES:
         if rx.search(blob):
-            return False
-    if location and BARE_LOCKED_LOCATION_RE.search(location):
-        return False
+            return "fail"
+    if location_names_specific_place(location):
+        return "borderline"
     for pat in REMOTE_INCLUDE_PATTERNS:
         if pat in blob:
-            return True
+            return "pass"
     if job.get("remote_native"):
+        return "pass"
+    return "fail"  # no remote signal at all -> can't confirm, so skip it
 
-        return True
-    return False  # no remote signal at all -> can't confirm, so skip it
+
+def is_globally_remote(job):
+    """Backward-compatible boolean wrapper: 'borderline' is treated as
+    False here (used only where a caller needs a plain yes/no and can't
+    route through AI -- main() uses classify_remote_status directly so
+    borderline cases actually get a fair AI review instead of this
+    conservative default)."""
+    return classify_remote_status(job) == "pass"
 
 
 def parse_salary_range(salary_text):
@@ -1283,6 +1325,8 @@ def passes_filters(job):
 # its unavailability never blocks a legitimately good match.
 
 AI_CHECK_PROMPT = """You are screening a single job posting for a Product Manager based in the Dominican Republic who needs the role to be genuinely, fully remote with NO country or region restriction, and NO citizenship/residency/work-authorization requirement, that would exclude the Dominican Republic (e.g. "US only", "must be a US citizen or resident", "must be authorized to work in the US/EU/UK", "North America only", hybrid, or onsite all disqualify it; "worldwide", "LATAM", "Latin America", "Caribbean", "the Americas", or no restriction at all all qualify it).
+
+IMPORTANT: the "Listed location(s)" field below is very often just the company's HQ or office city (e.g. "San Francisco, CA") shown by default on the job board, even for a role that is genuinely remote-first and open worldwide. Do NOT reject a posting just because a specific city or country appears in that field. Instead, read the actual job description text: if it explains the role is remote-first, distributed, open to any timezone, or otherwise doesn't require being in that location, treat it as worldwide-remote even though it never says "LATAM" or "Dominican Republic" by name. Only reject if the description itself states or implies a real requirement to be in a specific country/region (e.g. "must be based in the US", "candidates must reside in the EU", visa/work-authorization language, or explicit hybrid/onsite requirements).
 
 Job title: {title}
 Company: {company}
@@ -1464,48 +1508,102 @@ def main():
 
     print(f"Total title matches before remote/salary filters: {len(all_jobs)}")
 
-    filtered_jobs = [j for j in all_jobs if passes_filters(j)]
-    print(f"Passed remote-global + $150k+ filters: {len(filtered_jobs)}")
+    # Classify each job as pass/fail/borderline for remote-worldwide
+    # eligibility (see classify_remote_status), then apply the salary
+    # floor to whatever isn't an outright fail. Borderline jobs (location
+    # field names a specific place, but nothing else confirms or denies
+    # worldwide eligibility -- e.g. a company's HQ city shown as location
+    # while the description separately explains the role itself is
+    # remote-first/worldwide) are kept apart so they can get a real AI
+    # review below instead of being auto-rejected by keyword matching
+    # alone, which structurally can't tell that case apart from a
+    # genuinely restricted role.
+    pass_jobs, borderline_jobs = [], []
+    for j in all_jobs:
+        status = classify_remote_status(j)
+        if status == "fail":
+            continue
+        if not passes_salary_floor(j):
+            continue
+        (pass_jobs if status == "pass" else borderline_jobs).append(j)
+
+    print(f"Passed keyword remote check + $150k+ filter: {len(pass_jobs)} "
+          f"clear pass, {len(borderline_jobs)} borderline (location names a "
+          f"specific place, needs AI review to confirm either way)")
 
     seen = load_seen()
-    new_jobs = [j for j in filtered_jobs if j["id"] not in seen]
-
-    print(f"New (not previously seen): {len(new_jobs)}")
+    new_pass = [j for j in pass_jobs if j["id"] not in seen]
+    new_borderline = [j for j in borderline_jobs if j["id"] not in seen]
+    print(f"New (not previously seen): {len(new_pass)} pass, {len(new_borderline)} borderline")
 
     # AI context-verification pass (only if GEMINI_API_KEY is set) --
-    # applied only to genuinely new postings, capped at AI_CHECK_MAX_PER_RUN,
-    # with a short delay between calls to stay well within free-tier rate
-    # limits. A job that fails this check still gets marked "seen" so it
-    # isn't re-checked (and re-billed against quota) on every future run.
+    # applied only to genuinely new postings, capped at AI_CHECK_MAX_PER_RUN
+    # combined across both groups, with a short delay between calls to stay
+    # well within free-tier rate limits. A job that fails this check still
+    # gets marked "seen" so it isn't re-checked (and re-billed against
+    # quota) on every future run.
+    #
+    # The two groups are handled with OPPOSITE fallback behavior when the
+    # AI check itself is unavailable (no key, error, timeout):
+    #   - "pass" jobs: AI is a redundant double-check on an already-
+    #     confirmed match. Unavailable -> keep it (fail-open), same as
+    #     before -- the AI layer can only make this MORE strict, never less.
+    #   - "borderline" jobs: AI is the DECIDING factor, since keyword
+    #     matching alone already couldn't confirm or deny it. Unavailable
+    #     -> drop it (fail-closed) -- same conservative default as before
+    #     this change existed, so borderline cases are never worse off
+    #     than the old behavior, only potentially better when AI IS
+    #     available and can actually read the description.
     to_notify = []
     ai_checks_used = 0
     ai_calls_succeeded = 0
     ai_calls_failed = 0
-    for job in new_jobs:
+    borderline_rescued = 0
+
+    for job in new_pass:
         if GEMINI_API_KEY and ai_checks_used < AI_CHECK_MAX_PER_RUN:
             ai_checks_used += 1
             ai_result = passes_ai_remote_check(job)
-            if ai_result is None:
-                ai_calls_failed += 1
-            else:
-                ai_calls_succeeded += 1
-            time.sleep(2)  # stay comfortably under free-tier rate limits
+            ai_calls_succeeded += ai_result is not None
+            ai_calls_failed += ai_result is None
+            time.sleep(2)
             if ai_result is False:
-                seen.add(job["id"])  # don't re-check this one again next run
+                seen.add(job["id"])
                 continue
-            # ai_result True or None (check unavailable) -> keep the job
         to_notify.append(job)
+
+    for job in new_borderline:
+        if GEMINI_API_KEY and ai_checks_used < AI_CHECK_MAX_PER_RUN:
+            ai_checks_used += 1
+            ai_result = passes_ai_remote_check(job)
+            ai_calls_succeeded += ai_result is not None
+            ai_calls_failed += ai_result is None
+            time.sleep(2)
+            if ai_result is True:
+                borderline_rescued += 1
+                to_notify.append(job)
+            else:
+                seen.add(job["id"])  # False or unavailable -> drop, conservative default
+        else:
+            seen.add(job["id"])  # no AI configured -> can't confirm, drop (old default)
 
     if GEMINI_API_KEY:
         print(f"AI-checked {ai_checks_used} new postings "
               f"({ai_calls_succeeded} succeeded, {ai_calls_failed} failed/unavailable); "
-              f"{len(new_jobs) - len(to_notify)} dropped by AI, {len(to_notify)} remain")
+              f"{borderline_rescued} borderline postings rescued by AI reasoning; "
+              f"{len(to_notify)} total will be notified")
         if ai_checks_used > 0 and ai_calls_succeeded == 0:
             print("WARNING: every AI check call failed this run (0 succeeded). "
                   "The AI layer is silently doing nothing -- check the "
                   "'AI check unavailable' error lines above for the cause "
-                  "(e.g. a deprecated model name, invalid key, or quota exceeded).",
+                  "(e.g. a deprecated model name, invalid key, or quota exceeded). "
+                  "This also means borderline postings are being dropped "
+                  "instead of AI-reviewed right now.",
                   file=sys.stderr)
+    elif new_borderline:
+        print(f"NOTE: {len(new_borderline)} borderline postings this run had no "
+              f"way to be reviewed (GEMINI_API_KEY not set) and were dropped. "
+              f"Set that secret to let these get a real AI review instead.")
 
     send_digest(to_notify)
     for job in to_notify:
