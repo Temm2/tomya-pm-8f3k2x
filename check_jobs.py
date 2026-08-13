@@ -64,6 +64,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1063,7 +1064,18 @@ def fetch_all_web3_companies(max_workers=60):
             companies.append(gc)
             seen_keys.add(key)
 
-    print(f"Total companies to check this run: {len(companies)}")
+    print(f"Total companies before dead-cache filter: {len(companies)}")
+
+    # Skip anything already confirmed 404 in a past run -- no network call
+    # at all, which is the actual fix for slow runs: the vast majority of
+    # the general startup list's ~16k entries are stale/renamed slugs that
+    # will 404 every single time, forever, unless the upstream list is
+    # updated. No point re-discovering that every 24 hours.
+    dead_companies = load_dead_companies()
+    companies = [c for c in companies if f"{c['ats']}-{c['slug']}" not in dead_companies]
+    skipped_dead = len(dead_companies)
+    print(f"Skipping {skipped_dead} known-dead companies (cached from past runs); "
+          f"{len(companies)} left to actually check")
 
     fetch_fn = {
         "greenhouse": fetch_greenhouse_company,
@@ -1076,6 +1088,8 @@ def fetch_all_web3_companies(max_workers=60):
     }
 
     jobs = []
+    newly_dead = set()
+    http_error_count = 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(fetch_fn[c["ats"]], c): c for c in companies}
         for fut in as_completed(futures):
@@ -1089,7 +1103,23 @@ def fetch_all_web3_companies(max_workers=60):
             except Exception as e:
                 # Individual company APIs fail sometimes (renamed slug, temp
                 # outage, etc.) -- don't let one bad company kill the run.
-                print(f"  (skipped {c['name']} / {c['ats']}: {e})", file=sys.stderr)
+                # 404s are permanent (that slug genuinely doesn't exist) so
+                # they get cached; anything else (400/429/timeout) might be
+                # transient and gets retried next run instead.
+                http_error_count += 1
+                if isinstance(e, urllib.error.HTTPError) and e.code == 404:
+                    newly_dead.add(f"{c['ats']}-{c['slug']}")
+
+    if newly_dead:
+        dead_companies |= newly_dead
+        print(f"Cached {len(newly_dead)} newly-confirmed-dead companies "
+              f"({len(dead_companies)} total now cached) -- these will be "
+              f"skipped instantly in future runs")
+    # Always write the file (even with no new entries) so it's guaranteed
+    # to exist for the workflow's git add step every run.
+    save_dead_companies(dead_companies)
+    print(f"Company sweep: {http_error_count} errors out of {len(companies)} attempted")
+
     return jobs
 
 
@@ -1115,10 +1145,32 @@ REMOTE_EXCLUDE_PROXIMITY_REGEXES = [
 ]
 
 
+# Country/region names that, when they appear ALONE in the location field
+# (no accompanying worldwide/multi-region language anywhere in the
+# posting), mean "remote, but locked to this place" -- extremely common
+# phrasing on remote job boards (e.g. RemoteOK/Remotive frequently just
+# put "United States" as the location for a US-only remote role, with no
+# "only"/"must be" wording anywhere for the phrase-based excludes to
+# catch). Scoped to the location field specifically (not the whole blob)
+# to avoid false positives like "join us" in body text.
+BARE_LOCKED_LOCATION_RE = re.compile(
+    r"\b(united states|usa|u\.s\.a?\.?|uk|united kingdom|canada|australia|"
+    r"germany|france|spain|italy|netherlands|ireland|singapore|japan)\b"
+)
+# If any of these appear anywhere in the full posting, the bare-location
+# check above is overridden -- the role has explicitly signaled it's open
+# beyond that one place.
+GLOBAL_SAFE_WORD_RE = re.compile(
+    r"\b(worldwide|anywhere|global|globally|latam|latin america|caribbean|"
+    r"the americas|international|any country|any location|multiple "
+    r"countries|multiple locations)\b"
+)
+
+
 def is_globally_remote(job):
     """True if the role reads as open to anyone, anywhere.
 
-    Checked in four tiers, in order:
+    Checked in five tiers, in order:
       1. Explicit global-acceptance language (GLOBAL_OVERRIDE_PATTERNS)
          wins outright -- this rescues US-anchored postings that
          explicitly say they accept applicants from anywhere.
@@ -1127,8 +1179,13 @@ def is_globally_remote(job):
          REMOTE_EXCLUDE_PROXIMITY_REGEXES (which catch wording variations
          the fixed list can't anticipate, e.g. "US based applicants
          only") -- disqualifies. Applies regardless of source.
-      3. Generic remote language (REMOTE_INCLUDE_PATTERNS) passes.
-      4. No signal at all: for sources that are remote-only job boards by
+      3. A bare country/region name in the LOCATION FIELD specifically
+         (e.g. location is just "United States") with no worldwide
+         language anywhere else in the posting -- disqualifies. This is
+         the common case that doesn't say "only" or "must be" anywhere,
+         it just lists the required country as the location.
+      4. Generic remote language (REMOTE_INCLUDE_PATTERNS) passes.
+      5. No signal at all: for sources that are remote-only job boards by
          definition (job["remote_native"] is True -- RemoteOK, Remotive,
          WeWorkRemotely, Jobicy, Himalayas), trust that and pass, since
          every listing there is already remote by the board's own nature.
@@ -1136,7 +1193,8 @@ def is_globally_remote(job):
          boards -- all of which mix remote and onsite postings), no
          signal means it's dropped, since it genuinely can't be confirmed.
     """
-    blob = f"{job.get('location','')} {job.get('title','')} {job.get('text','')}".lower()
+    location = (job.get("location", "") or "").lower()
+    blob = f"{location} {job.get('title','')} {job.get('text','')}".lower()
     for pat in GLOBAL_OVERRIDE_PATTERNS:
         if pat in blob:
             return True
@@ -1146,10 +1204,13 @@ def is_globally_remote(job):
     for rx in REMOTE_EXCLUDE_PROXIMITY_REGEXES:
         if rx.search(blob):
             return False
+    if location and BARE_LOCKED_LOCATION_RE.search(location) and not GLOBAL_SAFE_WORD_RE.search(blob):
+        return False
     for pat in REMOTE_INCLUDE_PATTERNS:
         if pat in blob:
             return True
     if job.get("remote_native"):
+
         return True
     return False  # no remote signal at all -> can't confirm, so skip it
 
@@ -1207,7 +1268,7 @@ def passes_filters(job):
 # decision stands -- this check can only make the filter MORE strict, and
 # its unavailability never blocks a legitimately good match.
 
-AI_CHECK_PROMPT = """You are screening a single job posting for a Product Manager based in the Dominican Republic who needs the role to be genuinely, fully remote with NO country or region restriction that would exclude the Dominican Republic (e.g. "US only", "must be authorized to work in the US/EU/UK", "North America only", hybrid, or onsite all disqualify it; "worldwide", "LATAM", "Latin America", "Caribbean", "the Americas", or no restriction at all all qualify it).
+AI_CHECK_PROMPT = """You are screening a single job posting for a Product Manager based in the Dominican Republic who needs the role to be genuinely, fully remote with NO country or region restriction, and NO citizenship/residency/work-authorization requirement, that would exclude the Dominican Republic (e.g. "US only", "must be a US citizen or resident", "must be authorized to work in the US/EU/UK", "North America only", hybrid, or onsite all disqualify it; "worldwide", "LATAM", "Latin America", "Caribbean", "the Americas", or no restriction at all all qualify it).
 
 Job title: {title}
 Company: {company}
@@ -1264,6 +1325,25 @@ def tag_web3(job):
     return any(k in blob for k in WEB3_KEYWORDS)
 
 
+DEAD_COMPANIES_FILE = "dead_companies.json"
+
+
+def load_dead_companies():
+    """Companies confirmed 404 (definitively don't exist at that slug) in
+    a past run -- safe to skip without even attempting a request. Only
+    404s go here; 400/429/timeout stay untouched since those can be
+    transient (rate limits, temporary outages) rather than permanent."""
+    if os.path.exists(DEAD_COMPANIES_FILE):
+        with open(DEAD_COMPANIES_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_dead_companies(dead_keys):
+    with open(DEAD_COMPANIES_FILE, "w") as f:
+        json.dump(sorted(dead_keys), f, indent=2)
+
+
 def load_seen():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
@@ -1276,43 +1356,55 @@ def save_seen(seen_ids):
         json.dump(sorted(seen_ids), f, indent=2)
 
 
-def notify(job):
-    web3_tag = "🌐 web3" if tag_web3(job) else "web2"
-    lo, hi = parse_salary_range(job.get("salary", ""))
-    salary_tag = f"✅ verified ${int(hi):,}+" if hi is not None else "❓ salary not listed"
-    location = job.get("location", "") or "Remote"
-    is_priority = bool(job.get("priority"))
-
-    if not NTFY_TOPIC:
-        print(f"[no NTFY_TOPIC set] Would notify: {'⭐ PRIORITY ' if is_priority else ''}"
-              f"{job['title']} @ {job['company']} ({salary_tag}) -> {job['url']}")
+def send_digest(jobs):
+    """Sends ONE push notification summarizing every new job found this
+    run, instead of a separate notification per job. If there's nothing
+    new, nothing is sent at all -- a quiet run stays quiet."""
+    if not jobs:
+        print("No new postings to notify about -- staying quiet.")
         return
 
-    title = f"⭐ Priority PM role: {job['title']}" if is_priority else f"New PM role: {job['title']}"
-    message = (
-        f"{job['company']} ({job['source']}, {web3_tag})\n"
-        f"{location}\n"
-        f"{salary_tag}\n"
-        f"{job['url']}"
-    )
+    def format_job(job):
+        web3_tag = "🌐" if tag_web3(job) else "💻"
+        lo, hi = parse_salary_range(job.get("salary", ""))
+        salary_tag = f"${int(hi):,}+" if hi is not None else "salary n/a"
+        star = "⭐ " if job.get("priority") else ""
+        location = job.get("location", "") or "Remote"
+        return (f"{star}{web3_tag} {job['title']} @ {job['company']}\n"
+                f"{location} · {salary_tag}\n{job['url']}")
+
+    lines = [format_job(j) for j in jobs]
+    body = "\n\n".join(lines)
+    has_priority = any(j.get("priority") for j in jobs)
+    title = f"{len(jobs)} new PM role{'s' if len(jobs) != 1 else ''} today"
+
+    if not NTFY_TOPIC:
+        print(f"[no NTFY_TOPIC set] Would send digest: {title}")
+        for line in lines:
+            print(f"  {line}")
+        return
+
+    # ntfy caps message size (~4096 bytes) -- truncate gracefully rather
+    # than fail outright on a very high-volume day.
+    body_bytes = body.encode("utf-8")
+    if len(body_bytes) > 3800:
+        body = body_bytes[:3800].decode("utf-8", errors="ignore")
+        body += f"\n\n... +{len(jobs)} total, see repo Actions log for the full list"
+
     req = urllib.request.Request(
         f"https://ntfy.sh/{NTFY_TOPIC}",
-        data=message.encode("utf-8"),
+        data=body.encode("utf-8"),
         headers={
             "Title": title.encode("utf-8"),
-            "Click": job["url"],
-            # Priority jobs (major Silicon Valley companies) get ntfy's
-            # "high" priority -- a more insistent notification sound/style
-            # on your phone -- so they stand out from the broader sweep.
-            "Priority": "high" if is_priority else "default",
-            "Tags": "star" if is_priority else "briefcase",
+            "Priority": "high" if has_priority else "default",
+            "Tags": "star" if has_priority else "briefcase",
         },
         method="POST",
     )
     try:
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
-        print(f"Failed to notify for {job['url']}: {e}", file=sys.stderr)
+        print(f"Failed to send digest notification: {e}", file=sys.stderr)
 
 
 # ---- Main -----------------------------------------------------------
@@ -1388,8 +1480,8 @@ def main():
         print(f"AI-checked {ai_checks_used} new postings; "
               f"{len(new_jobs) - len(to_notify)} dropped by AI, {len(to_notify)} remain")
 
+    send_digest(to_notify)
     for job in to_notify:
-        notify(job)
         seen.add(job["id"])
 
     save_seen(seen)
