@@ -62,15 +62,43 @@ to rent.
    - After that it runs automatically every 4 hours, for free, forever
      (public repos get unlimited GitHub Actions minutes)
 
+- **~16,000 general startup companies** (all sizes, any industry) across
+  Greenhouse, Lever, and Ashby, sourced from a Common Crawl-based index
+  (github.com/Feashliaa/job-board-aggregator) -- the broadest net in the
+  bot, filling in the long tail beyond web3 and major tech.
+
 ## Adjusting it
 
 - **Check more/less often:** edit the `cron:` line in `job-alert.yml`.
-  `0 */3 * * *` = every 3 hours. `0 */6 * * *` = every 6 hours.
 - **Change keywords:** edit `TITLE_KEYWORDS` / `WEB3_KEYWORDS` at the top
   of `check_jobs.py`.
+- **Change the salary floor:** edit `SALARY_FLOOR` in `check_jobs.py`
+  (currently `150000`).
+- **Add/remove remote-wording patterns:** edit `REMOTE_INCLUDE_PATTERNS`
+  and `REMOTE_EXCLUDE_PATTERNS` in `check_jobs.py` if you notice a
+  posting slip through or get wrongly dropped.
 - **Add more sources:** any site with a public RSS feed or JSON API can be
   added as another `fetch_...()` function — send me the URL and I can
   wire it in.
+
+## What it filters for
+
+- **Product Manager roles** — title must contain "product manager,"
+  "product lead," "head of product," or "product owner."
+- **Remote, globally** — keeps a role only if some field (location,
+  title, or description) signals it's open to anyone, anywhere:
+  "remote," "worldwide," "anywhere," "distributed team," "fully
+  remote," etc. Drops anything region-locked ("US only," "must be
+  based in the UK," "authorized to work in the US"), and drops
+  hybrid/onsite roles too. If nothing in the posting signals either
+  way, it's dropped rather than guessed at.
+- **$150k+ salary** — keeps a role if a disclosed salary range reaches
+  $150,000 or higher, **or if no salary is disclosed at all** (most
+  postings don't publish a number, and dropping those would hide most
+  of the market). Only drops a role when a number IS published and
+  it's clearly below $150k. Every notification is tagged either
+  "✅ verified $150k+" or "❓ salary not listed" so you know at a
+  glance which case you're looking at.
 
 ## Why this is close to "all possible sources"
 
