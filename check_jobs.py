@@ -592,7 +592,7 @@ DEFI_LIST_URL = "https://raw.githubusercontent.com/tonisives/defi-jobs-list/main
 # bamboohr in particular has no genuine public jobs API, only an
 # undocumented internal widget endpoint that changes without notice, so it
 # doesn't meet the "stable free API" bar the others do.)
-SUPPORTED_ATS = {"greenhouse", "lever", "ashby", "recruitee", "workable"}
+SUPPORTED_ATS = {"greenhouse", "lever", "ashby", "recruitee", "workable", "smartrecruiters", "personio"}
 
 # Manually verified companies, added directly rather than relying on the
 # auto-pulled defi-jobs-list -- guaranteed accurate since each slug was
@@ -607,9 +607,93 @@ EXTRA_COMPANIES = [
     {"name": "Phantom", "ats": "ashby", "slug": "phantom"},                # Solana
     {"name": "Magic Eden", "ats": "ashby", "slug": "magiceden"},           # Solana
     {"name": "Jito Labs", "ats": "lever", "slug": "jito.wtf"},             # Solana
+    # SmartRecruiters -- confirmed real public customers, slugs verified
+    # against their actual careers.smartrecruiters.com pages.
+    {"name": "Visa", "ats": "smartrecruiters", "slug": "Visa"},
+    {"name": "Equinox", "ats": "smartrecruiters", "slug": "Equinox"},
+    # Personio -- infrastructure ready, but no company slugs could be
+    # verified during development (no bulk Personio company list found,
+    # and general search didn't surface a confirmed real subdomain).
+    # Add specific companies here once you know a real one, e.g.:
+    # {"name": "SomeCompany", "ats": "personio", "slug": "somecompany"},
 ]
 
+# ---- Silicon Valley / major tech companies (priority) -------------------
+# A community-maintained list of ~240 major tech companies (mostly Bay
+# Area HQ'd -- Airbnb, Stripe, Figma, Notion, Coinbase, OpenAI, Anthropic,
+# Databricks, and more, plus several already-web3 names like Alchemy,
+# Coinbase, Ripple, Fireblocks, Figment) mapped directly to their real
+# Greenhouse/Ashby/Lever API endpoints. Pulled live each run so it stays
+# current as the community adds companies.
+#
+# Jobs sourced from here are flagged priority=True (see notify()), since
+# these are the specific large, well-known companies worth surfacing more
+# insistently than the broader long-tail sweep.
+CLAUDE_JOBS_SKILL_URL = "https://raw.githubusercontent.com/jshchnz/claude-jobs/main/SKILL.md"
+CLAUDE_JOBS_ROW_RE = re.compile(r"^\|\s*([a-z0-9_\-]+)\s*\|\s*(https?://\S+)\s*\|$", re.MULTILINE)
+
+
+def load_priority_companies():
+    """Download the live claude-jobs company table and parse out
+    (name, ats, slug) for every entry on a supported ATS."""
+    req = urllib.request.Request(CLAUDE_JOBS_SKILL_URL, headers={"User-Agent": "job-alert-bot"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        text = resp.read().decode("utf-8")
+
+    companies = []
+    for name, endpoint in CLAUDE_JOBS_ROW_RE.findall(text):
+        ats = slug = None
+        if "boards-api.greenhouse.io" in endpoint:
+            m = re.search(r"boards-api\.greenhouse\.io/v1/boards/([^/]+)/jobs", endpoint)
+            ats, slug = "greenhouse", (m.group(1) if m else None)
+        elif "api.ashbyhq.com/posting-api/job-board" in endpoint:
+            m = re.search(r"job-board/([^/?]+)", endpoint)
+            ats, slug = "ashby", (m.group(1) if m else None)
+        elif "jobs.ashbyhq.com" in endpoint:
+            m = re.search(r"jobs\.ashbyhq\.com/([^/?]+)", endpoint)
+            ats, slug = "ashby", (m.group(1) if m else None)
+        elif "api.lever.co/v0/postings" in endpoint:
+            m = re.search(r"postings/([^/?]+)", endpoint)
+            ats, slug = "lever", (m.group(1) if m else None)
+        else:
+            continue  # one-off endpoints (e.g. sentry.io/jobs/list.json) -- skip
+        if slug:
+            companies.append({"name": name, "ats": ats, "slug": slug, "priority": True})
+    return companies
+
+
 TABLE_ROW_RE = re.compile(r"^\|(.+)\|$")
+
+
+# ---- General startup universe (all sizes, not just crypto/major tech) ---
+# A community-maintained dataset indexing ~16,000 companies across
+# Greenhouse/Lever/Ashby, built from Common Crawl -- this is the genuinely
+# broad "startups of all sizes" net: seed-stage to large, any industry,
+# not curated or hand-picked like the other lists. Much bigger than
+# everything else in this bot combined, so it meaningfully increases
+# coverage, at the real cost of a much longer run (~15k extra HTTP calls).
+# Company display names are just the URL slug (this dataset doesn't carry
+# proper names), lightly cleaned up for readability.
+GENERAL_STARTUPS_URLS = {
+    "greenhouse": "https://raw.githubusercontent.com/Feashliaa/job-board-aggregator/main/data/greenhouse_companies.json",
+    "lever": "https://raw.githubusercontent.com/Feashliaa/job-board-aggregator/main/data/lever_companies.json",
+    "ashby": "https://raw.githubusercontent.com/Feashliaa/job-board-aggregator/main/data/ashby_companies.json",
+}
+
+
+def load_general_startup_companies():
+    companies = []
+    for ats, url in GENERAL_STARTUPS_URLS.items():
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "job-alert-bot"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                slugs = json.loads(resp.read().decode("utf-8"))
+            for slug in slugs:
+                display_name = re.sub(r"-\d+$", "", slug).replace("-", " ").title()
+                companies.append({"name": display_name, "ats": ats, "slug": slug})
+        except Exception as e:
+            print(f"Failed to load general startup list for {ats}: {e}", file=sys.stderr)
+    return companies
 
 
 def load_web3_company_boards():
@@ -656,6 +740,12 @@ def load_web3_company_boards():
             slug = sm.group(1) if sm else None
         elif ats == "workable":
             sm = re.search(r"workable\.com/([a-z0-9\-]+)", board_url)
+            slug = sm.group(1) if sm else None
+        elif ats == "smartrecruiters":
+            sm = re.search(r"smartrecruiters\.com/([^/?#]+)", board_url)
+            slug = sm.group(1) if sm else None
+        elif ats == "personio":
+            sm = re.search(r"https?://([a-z0-9\-]+)\.jobs\.personio\.(?:de|com)", board_url)
             slug = sm.group(1) if sm else None
 
         if slug:
@@ -821,8 +911,84 @@ def fetch_workable_company(company):
     return jobs
 
 
-def fetch_all_web3_companies(max_workers=25):
-    """Fan out to every supported-ATS company board in parallel."""
+def fetch_smartrecruiters_company(company):
+    """SmartRecruiters Posting API -- officially documented as
+    unauthenticated for public postings (developers.smartrecruiters.com).
+    NOTE: unlike the other fetchers, this one could not be live-tested
+    against a real response during development (api.smartrecruiters.com
+    wasn't reachable from the build environment) -- built defensively
+    from the documented schema, with safe fallbacks throughout, but worth
+    keeping an eye on its "title matches" count in the run logs to
+    confirm it's actually returning data."""
+    url = f"https://api.smartrecruiters.com/v1/companies/{company['slug']}/postings"
+    req = urllib.request.Request(url, headers={"User-Agent": "job-alert-bot"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    jobs = []
+    for item in data.get("content", []):
+        title = item.get("name", "") or ""
+        if not any(k in title.lower() for k in TITLE_KEYWORDS):
+            continue
+        loc = item.get("location", {}) or {}
+        location_parts = [loc.get("city", ""), loc.get("region", ""), loc.get("country", "")]
+        location = ", ".join(p for p in location_parts if p)
+        if loc.get("remote"):
+            location = (location + " Remote").strip(", ").strip()
+        posting_id = item.get("id", "")
+        job_url = item.get("applyUrl") or item.get("postingUrl") or f"https://jobs.smartrecruiters.com/{company['slug']}/{posting_id}"
+        jobs.append({
+            "source": f"{company['name']} (SmartRecruiters)",
+            "id": f"smartrecruiters-{company['slug']}-{posting_id}",
+            "title": title,
+            "company": company["name"],
+            "location": location,
+            "url": job_url,
+            "salary": "",
+            "text": "",
+        })
+    return jobs
+
+
+def fetch_personio_company(company):
+    """Personio's public XML career feed -- officially documented by
+    Personio itself as requiring no credentials (support.personio.de).
+    Same live-testing caveat as SmartRecruiters above."""
+    url = f"https://{company['slug']}.jobs.personio.de/xml?language=en"
+    req = urllib.request.Request(url, headers={"User-Agent": "job-alert-bot"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+    root = ET.fromstring(raw)
+    jobs = []
+    for pos in root.iter("position"):
+        title = (pos.findtext("name") or "").strip()
+        if not any(k in title.lower() for k in TITLE_KEYWORDS):
+            continue
+        office = (pos.findtext("office") or "").strip()
+        remote_field = (pos.findtext("recruitingCategory") or "") + (pos.findtext("keywords") or "")
+        location = office
+        if "remote" in remote_field.lower() or "remote" in office.lower():
+            location = (location + " Remote").strip()
+        pos_id = pos.findtext("id") or ""
+        job_url = (pos.findtext("jobPostingUrl") or "").strip() or f"https://{company['slug']}.jobs.personio.de/job/{pos_id}"
+        desc_parts = [pos.findtext(tag) or "" for tag in ("jobDescriptions", "yourProfile", "whatWeOffer")]
+        text = strip_html(" ".join(desc_parts))[:3000]
+        jobs.append({
+            "source": f"{company['name']} (Personio)",
+            "id": f"personio-{company['slug']}-{pos_id}",
+            "title": title,
+            "company": company["name"],
+            "location": location,
+            "url": job_url,
+            "salary": "",
+            "text": text,
+        })
+    return jobs
+
+
+def fetch_all_web3_companies(max_workers=60):
+    """Fan out to every supported-ATS company board in parallel: the web3
+    sweep, manually verified extras, priority Silicon Valley companies,
+    and the general startup universe, all merged and deduped."""
     try:
         companies = load_web3_company_boards()
     except Exception as e:
@@ -838,12 +1004,51 @@ def fetch_all_web3_companies(max_workers=25):
             companies.append(extra)
             seen_keys.add(key)
 
+    # Merge in the Silicon Valley / major tech company list. These carry
+    # priority=True on the company dict, propagated onto each job below so
+    # notify() can flag them for a more insistent notification.
+    try:
+        priority_companies = load_priority_companies()
+    except Exception as e:
+        print(f"Failed to load priority company list: {e}", file=sys.stderr)
+        priority_companies = []
+    for pc in priority_companies:
+        key = (pc["ats"], pc["slug"])
+        if key not in seen_keys:
+            companies.append(pc)
+            seen_keys.add(key)
+        # If a company is already present (e.g. also in the web3 sweep),
+        # still mark it priority so it gets the elevated notification.
+        else:
+            for c in companies:
+                if (c["ats"], c["slug"]) == key:
+                    c["priority"] = True
+
+    # Merge in the general startup universe (~16k companies, all sizes).
+    # This is the largest source by far, so it's added last -- everything
+    # above (web3, extras, priority SV/tech) keeps its distinct company
+    # names and priority flags; this just fills in the long tail.
+    try:
+        general_companies = load_general_startup_companies()
+    except Exception as e:
+        print(f"Failed to load general startup list: {e}", file=sys.stderr)
+        general_companies = []
+    for gc in general_companies:
+        key = (gc["ats"], gc["slug"])
+        if key not in seen_keys:
+            companies.append(gc)
+            seen_keys.add(key)
+
+    print(f"Total companies to check this run: {len(companies)}")
+
     fetch_fn = {
         "greenhouse": fetch_greenhouse_company,
         "lever": fetch_lever_company,
         "ashby": fetch_ashby_company,
         "recruitee": fetch_recruitee_company,
         "workable": fetch_workable_company,
+        "smartrecruiters": fetch_smartrecruiters_company,
+        "personio": fetch_personio_company,
     }
 
     jobs = []
@@ -852,7 +1057,11 @@ def fetch_all_web3_companies(max_workers=25):
         for fut in as_completed(futures):
             c = futures[fut]
             try:
-                jobs.extend(fut.result())
+                company_jobs = fut.result()
+                if c.get("priority"):
+                    for j in company_jobs:
+                        j["priority"] = True
+                jobs.extend(company_jobs)
             except Exception as e:
                 # Individual company APIs fail sometimes (renamed slug, temp
                 # outage, etc.) -- don't let one bad company kill the run.
@@ -957,13 +1166,14 @@ def notify(job):
     lo, hi = parse_salary_range(job.get("salary", ""))
     salary_tag = f"✅ verified ${int(hi):,}+" if hi is not None else "❓ salary not listed"
     location = job.get("location", "") or "Remote"
+    is_priority = bool(job.get("priority"))
 
     if not NTFY_TOPIC:
-        print(f"[no NTFY_TOPIC set] Would notify: {job['title']} @ {job['company']} "
-              f"({salary_tag}) -> {job['url']}")
+        print(f"[no NTFY_TOPIC set] Would notify: {'⭐ PRIORITY ' if is_priority else ''}"
+              f"{job['title']} @ {job['company']} ({salary_tag}) -> {job['url']}")
         return
 
-    title = f"New PM role: {job['title']}"
+    title = f"⭐ Priority PM role: {job['title']}" if is_priority else f"New PM role: {job['title']}"
     message = (
         f"{job['company']} ({job['source']}, {web3_tag})\n"
         f"{location}\n"
@@ -976,7 +1186,11 @@ def notify(job):
         headers={
             "Title": title.encode("utf-8"),
             "Click": job["url"],
-            "Priority": "default",
+            # Priority jobs (major Silicon Valley companies) get ntfy's
+            # "high" priority -- a more insistent notification sound/style
+            # on your phone -- so they stand out from the broader sweep.
+            "Priority": "high" if is_priority else "default",
+            "Tags": "star" if is_priority else "briefcase",
         },
         method="POST",
     )
@@ -1006,7 +1220,7 @@ def main():
     # Direct web3 company careers pages (~1,000 companies, parallelized)
     try:
         company_jobs = fetch_all_web3_companies()
-        print(f"web3 company boards: {len(company_jobs)} title matches")
+        print(f"company boards (web3 + priority SV + general startups): {len(company_jobs)} title matches")
         all_jobs.extend(company_jobs)
     except Exception as e:
         print(f"Company board sweep failed: {e}", file=sys.stderr)
