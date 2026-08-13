@@ -96,17 +96,26 @@ SALARY_FLOOR = 150000
 # Signals that a role is open globally / remote-first. Checked against
 # location field + title + description, all lowercased.
 REMOTE_INCLUDE_PATTERNS = [
-    "remote", "anywhere", "worldwide", "world wide", "global", "globally",
+    "remote", "anywhere", "worldwide", "world wide",
     "distributed team", "distributed remote", "remote-first", "remote first",
     "work from home", "wfh", "fully remote", "100% remote", "remote friendly",
     "remote (global)", "remote - global", "remote global", "any location",
     "location independent", "location-independent", "international remote",
-    "remote (worldwide)", "remote - worldwide",
+    "remote (worldwide)", "remote - worldwide", "globally distributed",
+    "hiring globally", "remote globally", "global remote team",
     # LATAM/Americas-inclusive phrasing -- Dominican Republic falls within
     # all of these, so a role scoped this way is genuinely available to
     # you even without the word "remote" appearing separately.
     "latam", "latin america", "caribbean", "the americas",
 ]
+# NOTE: bare "global", "globally", and "international" are deliberately
+# NOT in this list. Crypto/tech company
+# descriptions are full of marketing language like "the world's leading
+# global exchange" or "serving customers internationally" -- that's about
+# the company/product, not confirmation the ROLE is open worldwide. Only
+# the specific compound phrases above (e.g. "hiring globally", "globally
+# distributed") count as genuine signal, since those explicitly reference
+# hiring/team/location rather than being generic company copy.
 
 # Signals that a role is region-locked, hybrid, or onsite -- these override
 # a REMOTE_INCLUDE match (e.g. "Remote (US only)" contains "remote" but is
@@ -1149,25 +1158,26 @@ REMOTE_EXCLUDE_PROXIMITY_REGEXES = [
 ]
 
 
-# Country/region names that, when they appear ALONE in the location field
-# (no accompanying worldwide/multi-region language anywhere in the
-# posting), mean "remote, but locked to this place" -- extremely common
-# phrasing on remote job boards (e.g. RemoteOK/Remotive frequently just
-# put "United States" as the location for a US-only remote role, with no
-# "only"/"must be" wording anywhere for the phrase-based excludes to
-# catch). Scoped to the location field specifically (not the whole blob)
-# to avoid false positives like "join us" in body text.
+# Country/region names that, when they appear ALONE in the location field,
+# mean "remote, but locked to this place" -- extremely common phrasing on
+# remote job boards (e.g. RemoteOK/Remotive frequently just put "United
+# States" as the location for a US-only remote role, with no "only"/"must
+# be" wording anywhere for the phrase-based excludes to catch). Scoped to
+# the location field specifically (not the whole blob) to avoid false
+# positives like "join us" in body text.
+#
+# Deliberately no local "safe word" override here (an earlier version had
+# one) -- even words like "worldwide" or "global" show up constantly as
+# marketing copy about the COMPANY/PRODUCT ("millions of users worldwide")
+# with no bearing on whether the ROLE itself is open worldwide, and no
+# fixed word list can reliably tell the difference. The only legitimate
+# rescue for a bare-locked location is GLOBAL_OVERRIDE_PATTERNS above
+# (checked first, tier 1) -- those are specific hiring-context phrases
+# ("open to global applicants," "hiring globally") that don't show up as
+# generic company-description filler the way single words do.
 BARE_LOCKED_LOCATION_RE = re.compile(
     r"\b(united states|usa|u\.s\.a?\.?|uk|united kingdom|canada|australia|"
     r"germany|france|spain|italy|netherlands|ireland|singapore|japan)\b"
-)
-# If any of these appear anywhere in the full posting, the bare-location
-# check above is overridden -- the role has explicitly signaled it's open
-# beyond that one place.
-GLOBAL_SAFE_WORD_RE = re.compile(
-    r"\b(worldwide|anywhere|global|globally|latam|latin america|caribbean|"
-    r"the americas|international|any country|any location|multiple "
-    r"countries|multiple locations)\b"
 )
 
 
@@ -1208,7 +1218,7 @@ def is_globally_remote(job):
     for rx in REMOTE_EXCLUDE_PROXIMITY_REGEXES:
         if rx.search(blob):
             return False
-    if location and BARE_LOCKED_LOCATION_RE.search(location) and not GLOBAL_SAFE_WORD_RE.search(blob):
+    if location and BARE_LOCKED_LOCATION_RE.search(location):
         return False
     for pat in REMOTE_INCLUDE_PATTERNS:
         if pat in blob:
