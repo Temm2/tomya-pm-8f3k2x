@@ -63,6 +63,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -100,6 +101,10 @@ REMOTE_INCLUDE_PATTERNS = [
     "remote (global)", "remote - global", "remote global", "any location",
     "location independent", "location-independent", "international remote",
     "remote (worldwide)", "remote - worldwide",
+    # LATAM/Americas-inclusive phrasing -- Dominican Republic falls within
+    # all of these, so a role scoped this way is genuinely available to
+    # you even without the word "remote" appearing separately.
+    "latam", "latin america", "caribbean", "the americas",
 ]
 
 # Signals that a role is region-locked, hybrid, or onsite -- these override
@@ -107,13 +112,21 @@ REMOTE_INCLUDE_PATTERNS = [
 # not globally remote). Timezone-only requirements are deliberately NOT
 # here -- you're open to German or US timezones (and others), so a role
 # requiring e.g. EST overlap isn't a disqualifier on its own.
+# Signals that a role is region-locked to somewhere NOT including Dominican
+# Republic, hybrid, or onsite -- these override a REMOTE_INCLUDE match (e.g.
+# "Remote (US only)" contains "remote" but isn't globally remote). Notably
+# does NOT include LATAM/Latin America/Caribbean/Americas restrictions --
+# those actually include the Dominican Republic, so a "LATAM only" role is
+# genuinely available to you and should pass, not get dropped.
 REMOTE_EXCLUDE_PATTERNS = [
     "us only", "u.s. only", "usa only", "united states only",
     "us-based only", "us based only", "us citizens only",
     "us applicants only", "us candidates only", "us residents only",
     "must be a us resident", "must be a us citizen",
+    "us work authorization", "us work permit", "authorization to work in the us",
+    "eligible to work in the us", "eligible to work in the united states",
     "uk only", "united kingdom only", "eu only", "european union only",
-    "emea only", "apac only", "latam only", "canada only",
+    "emea only", "apac only", "canada only",
     "canada-based", "canada based",
     "must be based in", "must reside in", "must be located in",
     "must be authorized to work in", "authorized to work in the us",
@@ -126,6 +139,10 @@ REMOTE_EXCLUDE_PATTERNS = [
     "remote (uk)", "remote - uk", "remote (eu)", "remote - eu",
     "remote (canada)", "us remote", "uk remote", "eu remote",
     "remote - north america", "remote (north america)",
+    "north america only", "based in north america", "north america timezones only",
+    "based in north america or europe", "north america or europe only",
+    "us, canada, and", "us, uk, and", "us/canada only", "us/uk only",
+    "candidates must be located in the us", "candidates must be based in the us",
 ]
 
 # Strongest signal of all: explicit language saying the company/role welcomes
@@ -150,6 +167,13 @@ GLOBAL_OVERRIDE_PATTERNS = [
 
 STATE_FILE = "seen_jobs.json"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")  # set via repo secret
+
+# Optional: free Gemini API key for AI-based context verification (see
+# passes_ai_remote_check below). If unset, this layer is simply skipped
+# and the keyword/regex filters alone decide -- nothing breaks either way.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = "gemini-2.0-flash"  # check ai.google.dev/gemini-api/docs/models if this is ever renamed
+AI_CHECK_MAX_PER_RUN = 50  # keeps well within the free tier's rate/quota limits
 
 
 # ---- Fetchers -----------------------------------------------------------
@@ -178,7 +202,7 @@ def fetch_remoteok():
             "location": item.get("location", "") or "",
             "url": item.get("url", ""),
             "salary": item.get("salary_min") and f"${item['salary_min']}-${item.get('salary_max','?')}" or "",
-            "text": (item.get("description") or "")[:2000],
+            "text": (item.get("description") or "")[:10000],
             "remote_native": True,  # RemoteOK only lists remote roles
         })
     return jobs
@@ -203,7 +227,7 @@ def fetch_remotive():
             "location": item.get("candidate_required_location", "") or "",
             "url": item.get("url", ""),
             "salary": item.get("salary", "") or "",
-            "text": (item.get("description") or "")[:2000],
+            "text": (item.get("description") or "")[:10000],
             "remote_native": True,  # Remotive only lists remote roles
         })
     return jobs
@@ -222,7 +246,7 @@ def fetch_wwr():
         if not any(k in title.lower() for k in TITLE_KEYWORDS):
             continue
         link = (item.findtext("link") or "").strip()
-        desc = (item.findtext("description") or "")[:2000]
+        desc = (item.findtext("description") or "")[:10000]
         # WWR region often shows up in a <region> tag on their feed
         region = (item.findtext("region") or "").strip()
         jobs.append({
@@ -253,7 +277,7 @@ def fetch_cryptojobslist():
         if not any(k in title.lower() for k in TITLE_KEYWORDS):
             continue
         link = (item.findtext("link") or "").strip()
-        desc = (item.findtext("description") or "")[:2000]
+        desc = (item.findtext("description") or "")[:10000]
         # Titles are often "Job Title at Company"
         company = ""
         if " at " in title:
@@ -292,7 +316,7 @@ def fetch_himalayas():
             "location": location,
             "url": item.get("applicationLink", ""),
             "salary": item.get("minSalary") and f"${item['minSalary']}-${item.get('maxSalary','?')}" or "",
-            "text": (item.get("excerpt") or "")[:2000],
+            "text": (item.get("excerpt") or "")[:10000],
             "remote_native": True,  # Himalayas only lists remote roles
         })
     return jobs
@@ -320,7 +344,7 @@ def fetch_arbeitnow():
             "location": location,
             "url": item.get("url", ""),
             "salary": "",
-            "text": (item.get("description") or "")[:2000],
+            "text": (item.get("description") or "")[:10000],
         })
     return jobs
 
@@ -347,7 +371,7 @@ def fetch_jobicy():
             "location": item.get("jobGeo", "") or "",
             "url": item.get("url", ""),
             "salary": salary,
-            "text": (item.get("jobExcerpt") or "")[:2000],
+            "text": (item.get("jobExcerpt") or "")[:10000],
             "remote_native": True,  # Jobicy only lists remote roles
         })
     return jobs
@@ -410,7 +434,7 @@ def fetch_hn_whoishiring():
             "location": "",
             "url": f"https://news.ycombinator.com/item?id={cid}",
             "salary": "",
-            "text": text[:3000],
+            "text": text[:10000],
         })
     return jobs
 
@@ -467,7 +491,7 @@ def fetch_telegram_channel(channel):
             "location": "",
             "url": f"https://t.me/{channel}/{msg_id}",
             "salary": "",
-            "text": text[:3000],
+            "text": text[:10000],
         })
     return jobs
 
@@ -553,7 +577,7 @@ def fetch_getro_network(network):
             jreq = urllib.request.Request(job_url, headers={"User-Agent": "job-alert-bot"})
             with urllib.request.urlopen(jreq, timeout=15) as jresp:
                 job_html = jresp.read().decode("utf-8", errors="ignore")
-            text = strip_html(job_html)[:4000]
+            text = strip_html(job_html)[:10000]
         except Exception:
             pass  # fall back to the slug-derived text if the detail page fetch fails
 
@@ -776,7 +800,7 @@ def fetch_greenhouse_company(company):
         if not any(k in title.lower() for k in TITLE_KEYWORDS):
             continue
         location = (item.get("location") or {}).get("name", "") or ""
-        text = strip_html(item.get("content", ""))[:3000]
+        text = strip_html(item.get("content", ""))[:10000]
         jobs.append({
             "source": f"{company['name']} (Greenhouse)",
             "id": f"gh-{company['slug']}-{item.get('id')}",
@@ -802,7 +826,7 @@ def fetch_lever_company(company):
             continue
         location = (item.get("categories") or {}).get("location", "") or ""
         raw_desc = item.get("descriptionPlain") or strip_html(item.get("description", ""))
-        text = (raw_desc or "")[:3000]
+        text = (raw_desc or "")[:10000]
         jobs.append({
             "source": f"{company['name']} (Lever)",
             "id": f"lever-{company['slug']}-{item.get('id')}",
@@ -833,7 +857,7 @@ def fetch_ashby_company(company):
             location = (location + " Remote").strip()
         comp = item.get("compensation", {}) or {}
         salary = comp.get("compensationTierSummary", "") or ""
-        text = strip_html(item.get("descriptionHtml", ""))[:3000]
+        text = strip_html(item.get("descriptionHtml", ""))[:10000]
         jobs.append({
             "source": f"{company['name']} (Ashby)",
             "id": f"ashby-{company['slug']}-{item.get('id')}",
@@ -866,7 +890,7 @@ def fetch_recruitee_company(company):
         if item.get("min_salary") or item.get("max_salary"):
             currency = item.get("salary_currency", "") or ""
             salary = f"{currency}{item.get('min_salary','?')}-{currency}{item.get('max_salary','?')}"
-        text = strip_html(item.get("description", "") or "")[:3000]
+        text = strip_html(item.get("description", "") or "")[:10000]
         job_url = item.get("careers_url") or f"https://{company['slug']}.recruitee.com/o/{item.get('slug','')}"
         jobs.append({
             "source": f"{company['name']} (Recruitee)",
@@ -896,7 +920,7 @@ def fetch_workable_company(company):
         location = ", ".join(p for p in location_parts if p)
         if loc.get("telecommuting"):
             location = (location + " Remote").strip(", ").strip()
-        text = strip_html(item.get("description", "") or "")[:3000]
+        text = strip_html(item.get("description", "") or "")[:10000]
         job_url = item.get("url", "") or f"https://apply.workable.com/{company['slug']}/j/{item.get('shortcode','')}"
         jobs.append({
             "source": f"{company['name']} (Workable)",
@@ -971,7 +995,7 @@ def fetch_personio_company(company):
         pos_id = pos.findtext("id") or ""
         job_url = (pos.findtext("jobPostingUrl") or "").strip() or f"https://{company['slug']}.jobs.personio.de/job/{pos_id}"
         desc_parts = [pos.findtext(tag) or "" for tag in ("jobDescriptions", "yourProfile", "whatWeOffer")]
-        text = strip_html(" ".join(desc_parts))[:3000]
+        text = strip_html(" ".join(desc_parts))[:10000]
         jobs.append({
             "source": f"{company['name']} (Personio)",
             "id": f"personio-{company['slug']}-{pos_id}",
@@ -1071,6 +1095,26 @@ def fetch_all_web3_companies(max_workers=60):
 
 # ---- Filters -----------------------------------------------------------
 
+# Regex-based catch for "<country/region> ... only" phrasing where extra
+# words get inserted between them (e.g. "US based applicants only",
+# "USA citizens and residents only") -- a fixed-phrase list can never
+# anticipate every wording variation, so this matches by proximity
+# instead: the region word followed by "only" within ~25 characters,
+# regardless of what's in between. Checked in the same exclude tier as
+# REMOTE_EXCLUDE_PATTERNS, just via regex instead of exact substrings.
+REMOTE_EXCLUDE_PROXIMITY_REGEXES = [
+    re.compile(r"\bus\b[\s\w,.\-]{0,25}\bonly\b"),
+    re.compile(r"\bu\.s\.[\s\w,.\-]{0,25}\bonly\b"),
+    re.compile(r"\busa\b[\s\w,.\-]{0,25}\bonly\b"),
+    re.compile(r"\bunited states\b[\s\w,.\-]{0,25}\bonly\b"),
+    re.compile(r"\buk\b[\s\w,.\-]{0,25}\bonly\b"),
+    re.compile(r"\bunited kingdom\b[\s\w,.\-]{0,25}\bonly\b"),
+    re.compile(r"\beu\b[\s\w,.\-]{0,25}\bonly\b"),
+    re.compile(r"\bcanada\b[\s\w,.\-]{0,25}\bonly\b"),
+    re.compile(r"\bnorth america\b[\s\w,.\-]{0,25}\bonly\b"),
+]
+
+
 def is_globally_remote(job):
     """True if the role reads as open to anyone, anywhere.
 
@@ -1078,9 +1122,11 @@ def is_globally_remote(job):
       1. Explicit global-acceptance language (GLOBAL_OVERRIDE_PATTERNS)
          wins outright -- this rescues US-anchored postings that
          explicitly say they accept applicants from anywhere.
-      2. Region-lock / hybrid / onsite language (REMOTE_EXCLUDE_PATTERNS)
-         disqualifies -- e.g. "Remote (US only)" contains "remote" but
-         isn't globally remote. Applies regardless of source.
+      2. Region-lock / hybrid / onsite language -- both the fixed-phrase
+         REMOTE_EXCLUDE_PATTERNS and the proximity-based
+         REMOTE_EXCLUDE_PROXIMITY_REGEXES (which catch wording variations
+         the fixed list can't anticipate, e.g. "US based applicants
+         only") -- disqualifies. Applies regardless of source.
       3. Generic remote language (REMOTE_INCLUDE_PATTERNS) passes.
       4. No signal at all: for sources that are remote-only job boards by
          definition (job["remote_native"] is True -- RemoteOK, Remotive,
@@ -1096,6 +1142,9 @@ def is_globally_remote(job):
             return True
     for pat in REMOTE_EXCLUDE_PATTERNS:
         if pat in blob:
+            return False
+    for rx in REMOTE_EXCLUDE_PROXIMITY_REGEXES:
+        if rx.search(blob):
             return False
     for pat in REMOTE_INCLUDE_PATTERNS:
         if pat in blob:
@@ -1140,6 +1189,72 @@ def passes_salary_floor(job):
 
 def passes_filters(job):
     return is_globally_remote(job) and passes_salary_floor(job)
+
+
+# ---- AI-based context verification (optional, needs GEMINI_API_KEY) ----
+# Keyword/regex matching can only catch phrasings anticipated in advance --
+# it can miss unusual wording entirely, or (rarely) misfire on legitimate
+# text. This is a genuinely different, complementary check: it sends the
+# job's actual description to Gemini and asks it to *read and reason
+# about* whether the role is truly open to someone in the Dominican
+# Republic, the same way a person would. Applied only to jobs that already
+# passed the keyword/regex filters and are genuinely new (not previously
+# seen) -- so it stays a small number of calls per run, comfortably within
+# the free tier.
+#
+# Fails open: any error (bad response, timeout, rate limit, no key set)
+# means this layer is simply skipped for that job and the keyword-based
+# decision stands -- this check can only make the filter MORE strict, and
+# its unavailability never blocks a legitimately good match.
+
+AI_CHECK_PROMPT = """You are screening a single job posting for a Product Manager based in the Dominican Republic who needs the role to be genuinely, fully remote with NO country or region restriction that would exclude the Dominican Republic (e.g. "US only", "must be authorized to work in the US/EU/UK", "North America only", hybrid, or onsite all disqualify it; "worldwide", "LATAM", "Latin America", "Caribbean", "the Americas", or no restriction at all all qualify it).
+
+Job title: {title}
+Company: {company}
+Listed location(s): {location}
+Job description text:
+{text}
+
+Read the actual content, not just keywords -- watch for negation, unusual phrasing, or restrictions stated indirectly. Respond with ONLY a JSON object, no other text, no markdown fences:
+{{"worldwide_remote": true or false, "reason": "one short sentence"}}"""
+
+
+def passes_ai_remote_check(job):
+    """Returns True/False if Gemini gave a clear answer, or None if the
+    check couldn't be completed (no key, error, timeout, bad response) --
+    None means "skip this layer," not "reject the job."""
+    if not GEMINI_API_KEY:
+        return None
+
+    prompt = AI_CHECK_PROMPT.format(
+        title=job.get("title", ""),
+        company=job.get("company", ""),
+        location=job.get("location", "") or "(not specified)",
+        text=(job.get("text", "") or "")[:6000],
+    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 200},
+    }
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Strip markdown code fences if Gemini adds them despite instructions
+        raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
+        parsed = json.loads(raw_text)
+        result = bool(parsed.get("worldwide_remote"))
+        reason = parsed.get("reason", "")
+        print(f"  AI check: {result} ({reason}) -- {job.get('title')} @ {job.get('company')}")
+        return result
+    except Exception as e:
+        print(f"  AI check unavailable for {job.get('title')} @ {job.get('company')}: {e}", file=sys.stderr)
+        return None
 
 
 # ---- Helpers -----------------------------------------------------------
@@ -1251,7 +1366,29 @@ def main():
 
     print(f"New (not previously seen): {len(new_jobs)}")
 
+    # AI context-verification pass (only if GEMINI_API_KEY is set) --
+    # applied only to genuinely new postings, capped at AI_CHECK_MAX_PER_RUN,
+    # with a short delay between calls to stay well within free-tier rate
+    # limits. A job that fails this check still gets marked "seen" so it
+    # isn't re-checked (and re-billed against quota) on every future run.
+    to_notify = []
+    ai_checks_used = 0
     for job in new_jobs:
+        if GEMINI_API_KEY and ai_checks_used < AI_CHECK_MAX_PER_RUN:
+            ai_checks_used += 1
+            ai_result = passes_ai_remote_check(job)
+            time.sleep(2)  # stay comfortably under free-tier rate limits
+            if ai_result is False:
+                seen.add(job["id"])  # don't re-check this one again next run
+                continue
+            # ai_result True or None (check unavailable) -> keep the job
+        to_notify.append(job)
+
+    if GEMINI_API_KEY:
+        print(f"AI-checked {ai_checks_used} new postings; "
+              f"{len(new_jobs) - len(to_notify)} dropped by AI, {len(to_notify)} remain")
+
+    for job in to_notify:
         notify(job)
         seen.add(job["id"])
 
