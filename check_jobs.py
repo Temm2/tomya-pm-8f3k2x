@@ -552,6 +552,8 @@ GETRO_NETWORKS = [
     {"name": "Avalanche Ecosystem", "base": "https://jobs.avax.network"},
     {"name": "Optimism Ecosystem", "base": "https://jobs.optimism.io"},
     {"name": "Blockchain Association", "base": "https://jobs.theblockchainassociation.org"},
+    {"name": "Sui Ecosystem", "base": "https://jobs.sui.io"},
+    {"name": "Polkadot Ecosystem", "base": "https://jobs.polkadot.com"},
 ]
 
 GETRO_JOB_URL_RE = re.compile(r"/companies/([a-z0-9\-]+)/jobs/(\d+)-([a-z0-9\-]+)")
